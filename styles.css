@@ -137,6 +137,12 @@ main {
 .status.error { color: var(--red); }
 .status.busy::after { content: " ⏳"; }
 
+.results-search { display: flex; gap: 8px; margin: 10px 0 4px; }
+.results-search input {
+  flex: 1; padding: 10px 12px; font-size: 0.95rem;
+  border: 1px solid var(--line); border-radius: 10px; background: #fff;
+}
+
 /* ---------- Results grid ---------- */
 .results-grid {
   display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 12px;

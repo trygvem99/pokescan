@@ -95,18 +95,24 @@ async function handleImageBlob(blob) {
   setOcrStatus(true, "Reading the card…");
 
   try {
-    const { data } = await Tesseract.recognize(blob, "eng");
+    // Downscale first — full-res phone photos are slow and can crash mobile OCR.
+    const canvas = await loadScaled(blob, 1100);
+    const { data } = await Tesseract.recognize(canvas, "eng", {
+      logger: (m) => {
+        if (m.status === "recognizing text")
+          setOcrStatus(true, `Reading the card… ${Math.round(m.progress * 100)}%`);
+      },
+    });
     const guess = parseCardText(data.text || "");
-    if (!guess.name && !guess.number) {
-      setOcrStatus(false, "Couldn’t read it clearly. Type the name below and search.");
+    if (!guess.tokens.length && !guess.number) {
+      setOcrStatus(false, "Couldn’t read it. Type the name in the box and search.");
       return;
     }
-    const human = [guess.name, guess.number && `#${guess.number}`].filter(Boolean).join(" ");
-    setOcrStatus(false, `Read: “${human}” — searching…`);
-    els.searchInput.value = [guess.name, guess.numberRaw].filter(Boolean).join(" ").trim();
+    setOcrStatus(false, `Read: ${guess.tokens.slice(0, 5).join(", ") || "—"}`);
+    els.searchInput.value = [guess.tokens[0], guess.numberRaw].filter(Boolean).join(" ").trim();
     await runSearch(guess);
   } catch (err) {
-    setOcrStatus(false, "OCR failed. Type the name below and search.");
+    setOcrStatus(false, "OCR failed. Type the name in the box and search.");
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -116,60 +122,73 @@ function setOcrStatus(busy, msg) {
   els.ocrStatus.innerHTML = (busy ? '<span class="spinner"></span>' : "") + msg;
 }
 
+/** Load an image blob into a downscaled canvas (longest side <= maxDim). */
+function loadScaled(blob, maxDim) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const u = URL.createObjectURL(blob);
+    img.onload = () => {
+      const s = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * s);
+      c.height = Math.round(img.height * s);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(u);
+      resolve(c);
+    };
+    img.onerror = (e) => { URL.revokeObjectURL(u); reject(e); };
+    img.src = u;
+  });
+}
+
+// Words that are never the card name — game text, energy types, common English.
+const STOP = new Set(
+  ("hp stage basic evolves from energy weakness resistance retreat trainer illus " +
+   "attack power damage put when may each all the and this your put discard draw " +
+   "fire water grass lightning psychic fighting darkness metal fairy dragon colorless " +
+   "pokemon length weight none turn during card cards into onto with for you").split(" ")
+);
+
 /**
- * Pull a likely card name and collector number out of raw OCR text.
- * Pokémon names sit at the top in large type; the collector number ("4/102")
- * sits small at the bottom. We grab both heuristically.
+ * Extract candidate name tokens + collector number from raw OCR text.
+ * Returns several tokens (the name is usually among the first); the search
+ * tries each until one yields matches, so a single misread word isn't fatal.
  */
 function parseCardText(text) {
-  const lines = text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  // Collector number like 4/102, 058/165, sometimes with surrounding noise.
   let number = "", total = "", numberRaw = "";
-  for (const line of lines) {
-    const m = line.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
-    if (m) {
-      number = String(parseInt(m[1], 10));
-      total = String(parseInt(m[2], 10));
-      numberRaw = `${m[1]}/${m[2]}`;
-      break;
-    }
+  const m = text.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
+  if (m) {
+    number = String(parseInt(m[1], 10));
+    total = String(parseInt(m[2], 10));
+    numberRaw = `${m[1]}/${m[2]}`;
   }
 
-  // Name: first line that is mostly letters, 3–20 chars, not obvious game text.
-  const STOP = /(HP|Stage|Basic|Evolves|Energy|Weakness|Resistance|Retreat|Trainer|Illus|Attack|Pokémon Power|©|Damage)/i;
-  let name = "";
-  for (const line of lines) {
-    const cleaned = line.replace(/[^A-Za-z'.\- ]/g, "").trim();
-    const letters = cleaned.replace(/[^A-Za-z]/g, "");
-    if (
-      cleaned.length >= 3 &&
-      cleaned.length <= 20 &&
-      letters.length >= 3 &&
-      !STOP.test(line) &&
-      letters.length / cleaned.length > 0.6
-    ) {
-      name = cleaned;
-      break;
-    }
+  const tokens = [];
+  const seen = new Set();
+  for (const w of text.replace(/[^A-Za-z'\-\s]/g, " ").split(/\s+/)) {
+    const word = w.replace(/^[-']+|[-']+$/g, "");
+    const lw = word.toLowerCase();
+    if (word.length < 3 || word.length > 15) continue;
+    if (!/^[A-Za-z]/.test(word) || STOP.has(lw) || seen.has(lw)) continue;
+    seen.add(lw);
+    tokens.push(word);
   }
 
-  return { name, number, total, numberRaw };
+  return { tokens, name: "", number, total, numberRaw, source: "ocr" };
 }
 
 /* ---------------------------------------------------------------------------
  * Search / identify
  * ------------------------------------------------------------------------- */
-els.searchForm.addEventListener("submit", (e) => {
+function handleTypedSearch(e) {
   e.preventDefault();
-  const raw = els.searchInput.value.trim();
+  const raw = (e.target.querySelector("input").value || "").trim();
   if (!raw) return;
   els.ocrPreview.hidden = true;
   runSearch(parseTypedQuery(raw));
-});
+}
+els.searchForm.addEventListener("submit", handleTypedSearch);
+document.getElementById("results-search-form").addEventListener("submit", handleTypedSearch);
 
 /** Parse a free-text query like `Charizard 4/102` into the same shape as OCR. */
 function parseTypedQuery(raw) {
@@ -181,43 +200,85 @@ function parseTypedQuery(raw) {
     numberRaw = `${m[1]}/${m[2]}`;
   }
   const name = raw.replace(/(\d{1,3})\s*\/\s*(\d{1,3})/, "").replace(/#/g, "").trim();
-  return { name, number, total, numberRaw };
+  const tokens = name.split(/\s+/).filter(Boolean);
+  return { tokens, name, number, total, numberRaw, source: "typed" };
 }
 
-function buildQuery({ name, number }) {
-  const parts = [];
-  if (name) {
-    const words = name.split(/\s+/).filter(Boolean);
-    if (words.length === 1) parts.push(`name:${words[0]}*`);
-    else parts.push(`name:"${name}"`);
-  }
-  if (number) parts.push(`number:${number}`);
-  return parts.join(" ");
+/**
+ * Build an ordered list of queries to try. The number is only used as an
+ * optional precise first attempt — never as a hard filter that could zero out
+ * results when OCR misreads it. First query that returns cards wins.
+ */
+function buildAttempts({ tokens, name, number, source }) {
+  const attempts = [];
+  const add = (q) => { if (q && !attempts.includes(q)) attempts.push(q); };
+  const primary = tokens.slice(0, 6);
+  const orClause = primary.length ? `(${primary.map((t) => `name:${t}*`).join(" OR ")})` : "";
+
+  // Precise first: any token AND the collector number (tightly constrained).
+  if (number && orClause) add(`${orClause} number:${number}`);
+  // Typed multi-word names: trust the exact phrase.
+  if (source === "typed" && tokens.length > 1) add(`name:"${name}"`);
+  // Broad fallbacks: each token alone, in reading order — first hit wins.
+  for (const t of primary) add(`name:${t}*`);
+  return attempts;
+}
+
+async function fetchCards(q) {
+  const url = `${API}?q=${encodeURIComponent(q)}&pageSize=30&orderBy=-set.releaseDate`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const json = await res.json();
+  return json.data || [];
 }
 
 async function runSearch(guess) {
   showView("results");
   els.resultsGrid.innerHTML = "";
   els.resultsStatus.innerHTML = '<span class="spinner"></span>Searching the card database…';
+  document.getElementById("results-search-input").value =
+    [guess.tokens[0], guess.numberRaw].filter(Boolean).join(" ").trim();
 
-  const q = buildQuery(guess);
-  if (!q) {
-    els.resultsStatus.textContent = "Nothing to search for — try a card name.";
+  const attempts = buildAttempts(guess);
+  if (!attempts.length) {
+    els.resultsStatus.textContent = "Nothing to search for — type a card name above.";
     return;
   }
 
   try {
-    const url = `${API}?q=${encodeURIComponent(q)}&pageSize=20&orderBy=-set.releaseDate`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    let cards = json.data || [];
+    // Merge two streams so neither hides the other:
+    //  - precise (name + number) surfaces exact/old cards the broad query misses
+    //  - broad (token alone) guarantees the species list always shows
+    const precise = attempts.filter((q) => q.includes("number:"));
+    const broad = attempts.filter((q) => !q.includes("number:"));
 
-    // If a collector total ("/102") was read, surface exact-set matches first.
-    if (guess.total) {
-      const t = parseInt(guess.total, 10);
-      cards.sort((a, b) => setMatches(b, t) - setMatches(a, t));
+    const cards = [];
+    const seen = new Set();
+    const collect = (arr) => {
+      for (const c of arr) if (!seen.has(c.id)) { seen.add(c.id); cards.push(c); }
+    };
+    const firstHit = async (queries) => {
+      for (const q of queries) {
+        const d = await fetchCards(q);
+        if (d.length) return d;
+      }
+      return [];
+    };
+
+    collect(await firstHit(precise));
+    collect(await firstHit(broad));
+
+    if (!cards.length) {
+      const read = guess.tokens.slice(0, 6).join(", ") || "(nothing readable)";
+      els.resultsStatus.innerHTML =
+        `No matches. I read: <em>${escapeHtml(read)}</em>. Fix the name in the box above and tap Go.`;
+      return;
     }
+
+    // Rank by collector number / set total so the likeliest card floats to top.
+    const num = guess.number ? parseInt(guess.number, 10) : null;
+    const tot = guess.total ? parseInt(guess.total, 10) : null;
+    cards.sort((a, b) => matchScore(b, num, tot) - matchScore(a, num, tot));
 
     renderResults(cards, guess);
   } catch (err) {
@@ -225,26 +286,28 @@ async function runSearch(guess) {
   }
 }
 
-function setMatches(card, total) {
+function matchScore(card, num, tot) {
   const s = card.set || {};
-  return s.printedTotal === total || s.total === total ? 1 : 0;
+  let score = 0;
+  if (tot && (s.printedTotal === tot || s.total === tot)) score += 2;
+  if (num && String(card.number) === String(num)) score += 1;
+  return score;
 }
 
 function renderResults(cards, guess) {
-  if (!cards.length) {
-    els.resultsStatus.innerHTML =
-      "No matches. Try just the Pokémon’s name, or check the spelling.";
-    return;
-  }
-  els.resultsStatus.textContent = `${cards.length} possible match${cards.length > 1 ? "es" : ""}.`;
+  const read = guess.tokens.slice(0, 5).join(", ");
+  els.resultsStatus.innerHTML =
+    `${cards.length} possible match${cards.length > 1 ? "es" : ""}` +
+    (read ? ` (read: <em>${escapeHtml(read)}</em>)` : "") + ". Tap the right one.";
 
-  const totalNum = guess.total ? parseInt(guess.total, 10) : null;
+  const num = guess.number ? parseInt(guess.number, 10) : null;
+  const tot = guess.total ? parseInt(guess.total, 10) : null;
   els.resultsGrid.innerHTML = "";
 
   for (const card of cards) {
     const cm = card.cardmarket && card.cardmarket.prices;
     const price = cm ? cm.trendPrice || cm.averageSellPrice : null;
-    const isMatch = totalNum && setMatches(card, totalNum);
+    const isMatch = matchScore(card, num, tot) >= 2;
 
     const div = document.createElement("div");
     div.className = "result-card";
