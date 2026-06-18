@@ -21,6 +21,7 @@ const els = {
   ocrPreview: el("ocr-preview"),
   ocrThumb: el("ocr-thumb"),
   ocrStatus: el("ocr-status"),
+  ocrRaw: el("ocr-raw"),
   scanView: el("scan-view"),
   resultsView: el("results-view"),
   resultsGrid: el("results-grid"),
@@ -57,7 +58,11 @@ async function initCamera() {
   }
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" } },
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      },
       audio: false,
     });
     els.camera.srcObject = stream;
@@ -73,53 +78,137 @@ async function initCamera() {
 els.captureBtn.addEventListener("click", () => {
   const v = els.camera;
   if (!v.videoWidth) return;
+  // Crop to the on-screen guide (centred card): drops background and enlarges
+  // the card so its small name text is legible to OCR. Insets mirror .card-frame.
+  const insetX = 0.16, insetY = 0.12;
+  const sx = v.videoWidth * insetX, sy = v.videoHeight * insetY;
+  const sw = v.videoWidth * (1 - insetX * 2), sh = v.videoHeight * (1 - insetY * 2);
   const c = els.canvas;
-  c.width = v.videoWidth;
-  c.height = v.videoHeight;
-  c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-  c.toBlob((blob) => blob && handleImageBlob(blob), "image/jpeg", 0.92);
+  c.width = sw;
+  c.height = sh;
+  c.getContext("2d").drawImage(v, sx, sy, sw, sh, 0, 0, sw, sh);
+  c.toBlob((blob) => blob && handleImageBlob(blob, true), "image/jpeg", 0.95);
 });
 
 els.fileInput.addEventListener("change", (e) => {
   const file = e.target.files && e.target.files[0];
-  if (file) handleImageBlob(file);
+  if (file) handleImageBlob(file, false);
 });
 
 /* ---------------------------------------------------------------------------
  * OCR pipeline
  * ------------------------------------------------------------------------- */
-async function handleImageBlob(blob) {
-  const url = URL.createObjectURL(blob);
-  els.ocrThumb.src = url;
-  els.ocrPreview.hidden = false;
-  setOcrStatus(true, "Reading the card…");
 
-  try {
-    // Downscale first — full-res phone photos are slow and can crash mobile OCR.
-    const canvas = await loadScaled(blob, 1100);
-    const { data } = await Tesseract.recognize(canvas, "eng", {
+// A single reusable Tesseract worker (loading its assets once is faster).
+let workerPromise = null;
+function getWorker() {
+  if (!workerPromise) {
+    workerPromise = Tesseract.createWorker("eng", 1, {
       logger: (m) => {
         if (m.status === "recognizing text")
           setOcrStatus(true, `Reading the card… ${Math.round(m.progress * 100)}%`);
       },
     });
-    const guess = parseCardText(data.text || "");
+  }
+  return workerPromise;
+}
+
+async function ocrRead(canvas, singleLine) {
+  const worker = await getWorker();
+  await worker.setParameters({
+    tessedit_pageseg_mode: singleLine ? "7" : "3", // 7 = single line, 3 = auto
+    tessedit_char_whitelist: singleLine
+      ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.- "
+      : "",
+  });
+  const { data } = await worker.recognize(canvas);
+  return data.text || "";
+}
+
+/**
+ * @param {boolean} cropped  true when the image is already cropped to the card
+ *   (live-camera capture), so the name sits in the top strip.
+ */
+async function handleImageBlob(blob, cropped) {
+  els.ocrPreview.hidden = false;
+  setOcrStatus(true, "Reading the card…");
+  els.ocrRaw.textContent = "";
+
+  try {
+    const canvas = await loadScaled(blob, 1400);
+    enhance(canvas); // grayscale + contrast — easier for OCR
+    els.ocrThumb.src = canvas.toDataURL("image/jpeg", 0.8);
+
+    // Focused pass on the title strip (only meaningful when cropped to the card).
+    let nameTokens = [];
+    if (cropped) {
+      const strip = cropFraction(canvas, 0, 0.02, 1, 0.18, 2.5); // top band, upscaled
+      const nameText = await ocrRead(strip, true);
+      nameTokens = nameText.split(/\s+/).map((w) => w.trim()).filter((w) => isNameToken(w));
+    }
+
+    // Full-card pass for the collector number and as a fallback for the name.
+    const fullText = await ocrRead(canvas, false);
+    const guess = parseCardText(fullText);
+    guess.tokens = dedupeTokens([...nameTokens, ...guess.tokens]);
+
+    const read = [guess.tokens.slice(0, 5).join(", "), guess.numberRaw && `#${guess.numberRaw}`]
+      .filter(Boolean)
+      .join("  ");
+    els.ocrRaw.textContent = read ? `Read: ${read}` : "Read nothing legible.";
+
     if (!guess.tokens.length && !guess.number) {
-      setOcrStatus(false, "Couldn’t read it. Type the name in the box and search.");
+      setOcrStatus(false, "Couldn’t read the name. Type it in the box and search.");
       return;
     }
-    setOcrStatus(false, `Read: ${guess.tokens.slice(0, 5).join(", ") || "—"}`);
+    setOcrStatus(false, "");
     els.searchInput.value = [guess.tokens[0], guess.numberRaw].filter(Boolean).join(" ").trim();
     await runSearch(guess);
   } catch (err) {
-    setOcrStatus(false, "OCR failed. Type the name in the box and search.");
-  } finally {
-    URL.revokeObjectURL(url);
+    setOcrStatus(false, "OCR failed to load. Type the name in the box and search.");
   }
 }
 
 function setOcrStatus(busy, msg) {
   els.ocrStatus.innerHTML = (busy ? '<span class="spinner"></span>' : "") + msg;
+}
+
+const isNameToken = (w) =>
+  w.length >= 3 && w.length <= 15 && /^[A-Za-z][A-Za-z'\-]*$/.test(w) && !STOP.has(w.toLowerCase());
+
+function dedupeTokens(arr) {
+  const seen = new Set(), out = [];
+  for (const w of arr) {
+    const k = w.toLowerCase();
+    if (!seen.has(k)) { seen.add(k); out.push(w); }
+  }
+  return out;
+}
+
+/** Grayscale + contrast stretch, in place. */
+function enhance(canvas) {
+  const ctx = canvas.getContext("2d");
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  const contrast = 1.45;
+  for (let i = 0; i < d.length; i += 4) {
+    let g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    g = (g - 128) * contrast + 128;
+    g = g < 0 ? 0 : g > 255 ? 255 : g;
+    d[i] = d[i + 1] = d[i + 2] = g;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+/** Crop a fractional region of a canvas into a new (optionally upscaled) canvas. */
+function cropFraction(src, fx, fy, fw, fh, scale = 1) {
+  const sx = src.width * fx, sy = src.height * fy;
+  const sw = src.width * fw, sh = src.height * fh;
+  const c = document.createElement("canvas");
+  c.width = Math.round(sw * scale);
+  c.height = Math.round(sh * scale);
+  c.getContext("2d").drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  return c;
 }
 
 /** Load an image blob into a downscaled canvas (longest side <= maxDim). */

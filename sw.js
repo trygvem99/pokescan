@@ -1,7 +1,7 @@
 /* Network-first service worker. Always fetches the latest code when online so
  * deploys reach users immediately; falls back to cache only when offline.
  * Card data and prices are always live (never served from cache). */
-const CACHE = "pokescan-v3";
+const CACHE = "pokescan-v4";
 const SHELL = ["./", "./index.html", "./styles.css", "./app.js", "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
